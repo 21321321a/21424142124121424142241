@@ -1,16 +1,18 @@
-# d.py — Replit-ready, SOCKS5 (with auth) support
+#!/usr/bin/env python3
+# d.py — Replit-ready: Telegram bot + Telethon send_code_request via SOCKS5 (with optional auth) + Flask healthcheck
+
 import os
 import asyncio
 import threading
-import socks
+import socks   # PySocks
 from flask import Flask
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ====== Конфиг ======
-PROXIES_FILE = "proxies.txt"       # ip:port or ip:port:user:pass
+# ====== Конфиг (можно менять) ======
+PROXIES_FILE = "proxies.txt"       # строки: ip:port  или ip:port:user:pass
 OK_PROXIES_FILE = "ok_proxies.txt"
 
 CONNECT_TIMEOUT = 15.0
@@ -18,29 +20,50 @@ SEND_CODE_TIMEOUT = 15.0
 IS_AUTH_TIMEOUT = 5.0
 MAX_SEND_PER_REQUEST = 25
 SEND_CONCURRENCY = 4
-DELAY_BETWEEN_TASKS = 0.2
+DELAY_BETWEEN_TASKS = 0.2   # секунды между стартами задач
 
-# Переменные окружения (задать в Replit Secrets)
+# Переменные окружения (на Replit задайте в Secrets)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH")
 
+# Небольшой fallback (необязательно) - если вы хотите использовать жестко захардкоженные значения,
+# раскомментируйте и укажите свои, но лучше через окружение.
+# if not BOT_TOKEN:
+#     BOT_TOKEN = "123:ABC..."
+# if not API_ID:
+#     API_ID = 27503668
+# if not API_HASH:
+#     API_HASH = "f654d14ed2b963765ba629d1352dacf5"
+
 if not BOT_TOKEN or not API_ID or not API_HASH:
-    raise RuntimeError("Нужно задать BOT_TOKEN, API_ID, API_HASH в окружении")
+    raise RuntimeError("Нужно задать BOT_TOKEN, API_ID, API_HASH в окружении (Replit Secrets или env).")
 
 # ====== Помощники ======
 def parse_proxy_line(line: str):
-    """Возвращает (host, port, user, pwd) — user/pwd могут быть None."""
+    """
+    Возвращает (host, port, user, pwd) — user/pwd могут быть None.
+    Поддерживается формат:
+      ip:port
+      ip:port:user:pass
+    Игнорирует пустые строки и комментарии (#).
+    """
     parts = line.strip().split(":")
     if len(parts) < 2:
         return None
     host = parts[0].strip()
     try:
         port = int(parts[1].strip())
-    except:
+    except Exception:
         return None
-    user = parts[2].strip() if len(parts) >= 4 else None
-    pwd = parts[3].strip() if len(parts) >= 4 else None
+    user = None
+    pwd = None
+    if len(parts) >= 3:
+        # если есть хотя бы 3 части, то третья часть может быть user (а четвертая — pwd)
+        # поддерживаем оба варианта: ip:port:user  (тогда pwd=None) и ip:port:user:pass
+        user = parts[2].strip() if parts[2].strip() != "" else None
+    if len(parts) >= 4:
+        pwd = parts[3].strip() if parts[3].strip() != "" else None
     return (host, port, user, pwd)
 
 def load_proxies(filename=PROXIES_FILE):
@@ -59,7 +82,17 @@ def load_proxies(filename=PROXIES_FILE):
 
 # ====== Telethon — попытка отправить код через SOCKS5-прокси ======
 async def try_send_via_socks(phone: str, host: str, port: int, user: str = None, pwd: str = None) -> bool:
-    proxy_tuple = (socks.SOCKS5, host, port, True, user, pwd) if user else (socks.SOCKS5, host, port)
+    """
+    Возвращает True если send_code_request успешно вызван (т.е. код отправлен).
+    Подключается к Telegram через Telethon, затем отключается.
+    """
+    # Telethon ожидает прокси-формат похожий на (socks.SOCKS5, host, port, rdns, username, password)
+    if user:
+        proxy_tuple = (socks.SOCKS5, host, port, True, user, pwd)
+    else:
+        proxy_tuple = (socks.SOCKS5, host, port)
+
+    # Используем уникальное имя сессии по proxy, чтобы не мешать другим
     session_name = f"session_{host.replace('.', '_')}_{port}"
     client = TelegramClient(session_name, API_ID, API_HASH, proxy=proxy_tuple)
 
@@ -68,7 +101,8 @@ async def try_send_via_socks(phone: str, host: str, port: int, user: str = None,
     except Exception as e:
         try:
             await client.disconnect()
-        except: pass
+        except: 
+            pass
         print(f"[connect fail] {host}:{port} -> {repr(e)}")
         return False
 
@@ -87,16 +121,19 @@ async def try_send_via_socks(phone: str, host: str, port: int, user: str = None,
                 print(f"[floodwait] {host}:{port} -> wait {fe.seconds}s")
             except Exception as e:
                 print(f"[send fail] {host}:{port} -> {repr(e)}")
+        else:
+            print(f"[already auth] client via {host}:{port} reports already authorized (skipped).")
     finally:
         try:
             await client.disconnect()
-        except: pass
+        except:
+            pass
 
     return False
 
 # ====== Handlers бота ======
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Пришли номер в формате +79998887766")
+    await update.message.reply_text("Привет! Пришли номер в формате +79998887766 (только цифры и ведущий '+').")
 
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
@@ -104,7 +141,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат. Пример: +79998887766")
         return
 
-    await update.message.reply_text(f"Принял {phone}. Начинаю попытки через SOCKS5...")
+    await update.message.reply_text(f"Принял {phone}. Начинаю попытки через SOCKS5-прокси... (макс {MAX_SEND_PER_REQUEST})")
 
     proxies = load_proxies()
     if not proxies:
@@ -118,27 +155,32 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def worker(host, port, user, pwd):
         nonlocal sent
-        async with sem:
-            print(f"Пробую прокси {host}:{port} (user={bool(user)})")
+        await sem.acquire()
+        try:
+            print(f"Пробую прокси {host}:{port} (auth={bool(user)})")
             ok = await try_send_via_socks(phone, host, port, user, pwd)
             if ok:
                 sent += 1
-                ok_list.append(f"{host}:{port}")
+                ok_list.append(f"{host}:{port}" + (f":{user}:{pwd}" if user else ""))
+        finally:
+            sem.release()
 
     tasks = []
     for host, port, user, pwd in to_try:
         tasks.append(asyncio.create_task(worker(host, port, user, pwd)))
+        # небольшая пауза между старта задач, чтобы не запускать все одновременно
         await asyncio.sleep(DELAY_BETWEEN_TASKS)
 
     if tasks:
         await asyncio.gather(*tasks)
 
+    # сохраняем удачные прокси (без паролей, если хотите — можно изменить)
     if ok_list:
         with open(OK_PROXIES_FILE, "w", encoding="utf-8") as f:
             for line in ok_list:
                 f.write(line + "\n")
 
-    await update.message.reply_text(f"Готово. Попыток отправки кода: {sent}. Успешные прокси: {len(ok_list)}.")
+    await update.message.reply_text(f"Готово. Попыток отправки кода (успешных): {sent}. Успешные прокси: {len(ok_list)}.")
 
 # ====== Flask для healthcheck (фон) ======
 flask_app = Flask(__name__)
@@ -149,7 +191,6 @@ def index():
 
 def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    # Replit м.б. использует 0.0.0.0:10000 — нормально
     flask_app.run(host="0.0.0.0", port=port)
 
 # ====== Запуск бота (главный поток) ======
